@@ -2,7 +2,9 @@ import sets
 import sequtils
 
 type
-    Flag* = tuple[name: string, bit: int8]
+    Flag* = tuple
+        name: string
+        bit: int8
     FlagsObj = object
         valid_flags : HashSet[string]
         flags : HashSet[string]
@@ -17,6 +19,7 @@ iterator items*(f: Flags) : string =
 proc len*(f: Flags) : int = result = f.flags.len
 
 proc contains*(f: Flags, s: string) : bool = s in f.flags
+proc `in`*(s: string, f: Flags) : bool {.inline.} = f.contains(s)
 
 proc exclude*(f: Flags, s: string) : void = f.flags.excl(s)
 

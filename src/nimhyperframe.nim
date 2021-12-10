@@ -1,5 +1,5 @@
-import nimhyperframe/defects
+import nimhyperframe/errors
 import nimhyperframe/flags
 
-export defects
+export errors
 export flags
