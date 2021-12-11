@@ -17,11 +17,11 @@ const
 
 const
     STRUCT_HBBBL: string = ">HbbbI"
-    STRUCT_LL{.used.}: string = ">II"
+    STRUCT_LL: string = ">II"
     STRUCT_HL: string = ">HI"
     STRUCT_LB: string = ">Ib"
     STRUCT_L: string = ">I"
-    STRUCT_H{.used.}: string = ">H"
+    STRUCT_H: string = ">H"
     STRUCT_B: string = ">b"
 
 type
@@ -36,6 +36,7 @@ type
         GoAwayFrameType=0x07'u8
         WindowUpdateFrameType=0x08'u8
         ContinuationFrameType=0x09'u8
+        AltSvcFrameType=0xA'u8
     Settings* = enum
         HEADER_TABLE_SIZE = 0x01'u16 ## The byte that signals the SETTINGS_HEADER_TABLE_SIZE setting.
         ENABLE_PUSH = 0x02'u16 ## The byte that signals the SETTINGS_ENABLE_PUSH setting.
@@ -66,6 +67,8 @@ proc newExtensionFrame*(frame_type: uint8; stream_id: uint32; flag_byte: uint8 =
 proc newGoAwayFrame*(stream_id: uint32 = 0; last_stream_id: uint32 = 0; error_code: uint32 = 0; additional_data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
 proc newWindowUpdateFrame*(stream_id: uint32; window_increment: uint32 = 0; flags: seq[string] = @[]) : Frame
 proc newContinuationFrame*(stream_id: uint32; data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
+proc newAltSvcFrame*(stream_id: uint32; origin: seq[byte] = @[]; field: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
+proc newHeadersFrame*(stream_id: uint32; pad_length: uint32 = 0; data: seq[byte] = @[]; depends_on: uint32 = 0, stream_weight: uint8 = 0, exclusive: bool = false; flags: seq[string] = @[]) : Frame
 
 proc newSetting(f: int) : Settings {.inline.} =
     case f.uint8
@@ -127,6 +130,7 @@ proc parse_from_header*(header: seq[byte]; strict: bool = false) : tuple[frame: 
     var frame = try:
         case FrameType(typ)
         of DataFrameType: newDataFrame(stream_id)
+        of HeadersFrameType: newHeadersFrame(stream_id)
         of PingFrameType: newPingFrame(stream_id)
         of PriorityFrameType: newPriorityFrame(stream_id)
         of RstStreamFrameType: newRstStreamFrame(stream_id)
@@ -557,3 +561,90 @@ method serialize_body(c: ContinuationFrame) : seq[byte] {.inline, locks: "unknow
 method parse_body(c: ContinuationFrame, data: seq[byte]) {.locks: "unknown".} =
     c.data = data
     c.body_len = data.len
+
+type
+    AltSvcFrame* = ref AltSvcFrameObj
+    AltSvcFrameObj = object of Frame
+        field: seq[byte]
+        origin: seq[byte]
+
+proc field*(a: AltSvcFrame) : seq[byte] {.inline.} = a.field
+proc origin*(a: AltSvcFrame) : seq[byte] {.inline.} = a.origin
+
+proc newAltSvcFrame*(stream_id: uint32; origin: seq[byte] = @[]; field: seq[byte] = @[]; flags: seq[string] = @[]) : Frame =
+    result = new(AltSvcFrame)
+    result.typ = AltSvcFrameType.some
+    result.name = "AltSvcFrame"
+    result.stream_association = STREAM_ASSOC_EITHER.some
+    initFrame(result, stream_id, flags)
+    AltSvcFrame(result).field = field
+    AltSvcFrame(result).origin = origin
+
+method body_repr(a: AltSvcFrame) : string {.inline, locks: "unknown".} =
+    return "origin=" & cast[string](a.origin) & ", field=" & cast[string](a.field)
+method serialize_body(a: AltSvcFrame) : seq[byte] {.locks: "unknown".} =
+    result = cast[seq[byte]](STRUCT_H.pack(a.origin.len))
+    result.add a.origin
+    result.add a.field
+method parse_body(a: AltSvcFrame, data: seq[byte]) {.locks: "unknown".} =
+    try:
+        let origin_len = STRUCT_H.unpack(cast[string](data[0..<min(2, high(data)+1)]))[0].getShort
+        a.origin = data[min(2, high(data)+1)..<min(2+origin_len, high(data)+1)]
+        if a.origin.len != origin_len:
+            raise newException(InvalidFrameError, "Invalid ALTSVC frame body.")
+        a.field = data[min(2+origin_len, high(data)+1)..^1]
+    except ValueError:
+        raise newException(InvalidFrameError, "Invalid ALTSVC frame body.")
+    a.body_len = data.len
+
+type
+    HeadersFrame* = ref HeadersFrameObj
+    HeadersFrameObj = object of Frame
+        pad_length: uint32
+        depends_on: uint32
+        stream_weight: uint8
+        exclusive: bool
+        data: seq[byte]
+
+proc pad_length*(h: HeadersFrame) : uint32 {.inline.} = result = h.pad_length
+proc depends_on*(h: HeadersFrame) : uint32 {.inline.} = h.depends_on
+proc stream_weight*(h: HeadersFrame) : uint8 {.inline.} = h.stream_weight
+proc exclusive*(h: HeadersFrame) : bool {.inline.} = h.exclusive
+
+proc newHeadersFrame*(stream_id: uint32; pad_length: uint32 = 0; data: seq[byte] = @[]; depends_on: uint32 = 0, stream_weight: uint8 = 0, exclusive: bool = false; flags: seq[string] = @[]) : Frame =
+    result = new(HeadersFrame)
+    result.typ = HeadersFrameType.some
+    result.name = "HeadersFrame"
+    result.stream_association = STREAM_ASSOC_HAS_STREAM.some
+    result.defined_flags = @[
+        (name: "END_STREAM", bit: 0x01'u8),
+        (name: "END_HEADERS", bit: 0x04'u8),
+        (name: "PADDED", bit: 0x08'u8),
+        (name: "PRIORITY", bit: 0x20'u8)
+    ]
+    initFrame(result, stream_id, flags)
+    HeadersFrame(result).depends_on = depends_on
+    HeadersFrame(result).stream_weight = stream_weight
+    HeadersFrame(result).exclusive = exclusive
+    HeadersFrame(result).pad_length = pad_length
+    HeadersFrame(result).data = data
+
+method body_repr(h: HeadersFrame) : string {.inline, locks: "unknown".} =
+    return "exclusive=" & $h.exclusive &
+            ", depends_on=" & $h.depends_on &
+            ", stream_weight=" & $h.stream_weight &
+            ", data=" & raw_data_repr(h.data)
+method serialize_body(h: HeadersFrame) : seq[byte] {.locks: "unknown".} =
+    result = h.serialize_padding_data
+    if "PRIORITY" in h.flags:
+        result.add h.serialize_priority_data
+    result.add h.data
+    result.add newSeq[byte](h.pad_length)
+method parse_body(h: HeadersFrame, data: seq[byte]) {.locks: "unknown".} =
+    let padding_data_len = h.parse_padding_data(data)
+    let data = data[min(padding_data_len, high(data) + 1)..^1]
+    let priority_data_len = if "PRIORITY" in h.flags: h.parse_priority_data(data) else: 0
+    h.body_len = data.len
+    h.data = data[min(high(data)+1, priority_data_len)..<min(high(data)+1, data.len - h.pad_length.int)]
+    if h.pad_length > 0 and h.pad_length.int >= h.body_len:
+        raise newException(InvalidPaddingError, "Padding is too long.")
