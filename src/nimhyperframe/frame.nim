@@ -244,11 +244,10 @@ method serialize_body(d: DataFrame) : seq[byte] {.locks: "unknown".} =
     result.add newSeq[byte](d.pad_length)
 method parse_body(d: DataFrame, data: seq[byte]) {.locks: "unknown".} =
     let padding_data_length = d.parse_padding_data(data)
-
-    d.data = data[padding_data_length..<min(data.len - d.pad_length.int, high(data)+1)]
     d.body_len = data.len
     if d.pad_length > 0 and d.pad_length.int64 >= d.body_len:
         raise newException(InvalidPaddingError, "Padding is too long.")
+    d.data = data[padding_data_length..<min(data.len - d.pad_length.int, high(data)+1)]
 
 type
     PriorityFrame* = ref PriorityFrameObj
@@ -390,12 +389,12 @@ method parse_body(p: PushPromiseFrame, data: seq[byte]) {.locks: "unknown".} =
         STRUCT_L.unpack(cast[string](data[padding_data_length..<min(padding_data_length+4, high(data)+1)]))[0].getUInt
     except ValueError:
         raise newException(InvalidFrameError, "Invalid PUSH_PROMISE body")
-    p.data = data[min(padding_data_length+4, high(data)+1)..<min(data.len - p.pad_length.int, high(data)+1)]
     p.body_len = data.len
     if p.promised_stream_id == 0 or (p.promised_stream_id and 1) != 0:
         raise newException(InvalidDataError, "Invalid PUSH_PROMISE promised stream id: " & $p.promised_stream_id)
     if p.pad_length > 0 and p.pad_length.int64 >= p.body_len:
         raise newException(InvalidPaddingError, "Padding is too long.")
+    p.data = data[min(padding_data_length+4, high(data)+1)..<min(data.len - p.pad_length.int, high(data)+1)]
 
 type
     PingFrame* = ref PingFrameObj
@@ -643,6 +642,6 @@ method parse_body(h: HeadersFrame, data: seq[byte]) {.locks: "unknown".} =
     let data = data[min(padding_data_len, high(data) + 1)..^1]
     let priority_data_len = if "PRIORITY" in h.flags: h.parse_priority_data(data) else: 0
     h.body_len = data.len
-    h.data = data[min(high(data)+1, priority_data_len)..<min(high(data)+1, data.len - h.pad_length.int)]
     if h.pad_length > 0 and h.pad_length.int >= h.body_len:
         raise newException(InvalidPaddingError, "Padding is too long.")
+    h.data = data[min(high(data)+1, priority_data_len)..<min(high(data)+1, data.len - h.pad_length.int)]

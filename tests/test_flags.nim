@@ -3,7 +3,6 @@ from sequtils import toSeq
 
 import nimhyperframe
 
-skip()
 suite "Flags test suite":
     test "Add flag":
         var flags = newFlags(@[(name: "VALID_FLAG", bit: 0x00.uint8)])
