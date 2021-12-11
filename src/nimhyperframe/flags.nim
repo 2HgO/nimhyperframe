@@ -1,10 +1,11 @@
 import sets
-import sequtils
+from sequtils import map, toSeq
+from algorithm import sort
 
 type
     Flag* = tuple
         name: string
-        bit: int8
+        bit: uint8
     FlagsObj = object
         valid_flags : HashSet[string]
         flags : HashSet[string]
@@ -18,8 +19,8 @@ iterator items*(f: Flags) : string =
 
 proc len*(f: Flags) : int = result = f.flags.len
 
-proc contains*(f: Flags, s: string) : bool = s in f.flags
-proc `in`*(s: string, f: Flags) : bool {.inline.} = f.contains(s)
+proc contains*(f: Flags, s: string) : bool {.inline.} = s in f.flags
+proc `in`*(s: string, f: Flags) : bool {.inline.} = s in f.flags
 
 proc exclude*(f: Flags, s: string) : void = f.flags.excl(s)
 
@@ -28,4 +29,6 @@ proc add*(f: Flags, s: string) : void =
     f.flags.incl(s)
 
 proc `$`*(f: Flags) : string =
-    result = $f.flags
+    var list = f.flags.toSeq
+    sort(list, cmp)
+    result = $list
