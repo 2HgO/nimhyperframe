@@ -13,7 +13,26 @@ proc decode_frame(data: seq[byte]) : Frame =
     doAssert 9+length == data.len
     return f
 
+# type
+#     SerializableFrameWithShortData = ref object of Frame
+#     SerializableFrameWithLongData = ref object of Frame
+
+# method serialize_body(f: SerializableFrameWithShortData) : seq[byte] {.inline, locks: "unknown".} = cast[seq[byte]]("body")
+# method serialize_body(f: SerializableFrameWithLongData) : seq[byte] {.inline, locks: "unknown".} = cast[seq[byte]](repeat("A", 25))
+
 suite "General frame behaviour test suite":
+    # test "repr":
+    #     block:
+    #         var frame: Frame = new SerializableFrameWithShortData
+    #         initFrame(frame, 0)
+    #         checkpoint $frame
+    #         check(($frame) == "Frame(stream_id=0, flags=@[]): <hex:626F6479>")
+    #     block:
+    #         var frame: Frame = new SerializableFrameWithLongData
+    #         initFrame(frame, 42)
+    #         checkpoint $frame
+    #         check(($frame) == "Frame(stream_id=42, flags=@[]): <hex:" & repeat("41", 10) & "...>")
+        
     test "Base frame ignores flags":
         var f = new(Frame)
         initFrame(f, 0)
@@ -399,7 +418,6 @@ suite "GoAway Frame test suite":
         expect InvalidFrameError:
             discard decode_frame(s)
 
-
 suite "Window Update Frame test suite":
     test "repr":
         var f = newWindowUpdateFrame(0)
@@ -518,13 +536,13 @@ suite "AltSvs Frame test suite":
     test "AltSvc with origin and stream serializes properly":
         let f = newAltSvcFrame(1, field = cast[seq[byte]]("""Alt-Svc: h2=":443"; ma=2592000; persist=1"""), origin = cast[seq[byte]]("""example.com"""))
         check(f.serialize == payload_with_origin_and_stream)
-    # test "AltSvc with origin and stream parses properly":
-    #     let f = decode_frame(payload_with_origin_and_stream)
-    #     check(f.typ.get == AltSvcFrameType)
-    #     check(AltSvcFrame(f).origin == cast[seq[byte]]("""example.com"""))
-    #     check(AltSvcFrame(f).field == cast[seq[byte]]("""Alt-Svc: h2=":443"; ma=2592000; persist=1"""))
-    #     check(f.body_len == 49)
-    #     check(f.stream_id == 1)
+    test "AltSvc with origin and stream parses properly":
+        let f = decode_frame(payload_with_origin_and_stream)
+        check(f.typ.get == AltSvcFrameType)
+        check(AltSvcFrame(f).origin == cast[seq[byte]]("""example.com"""))
+        check(AltSvcFrame(f).field == cast[seq[byte]]("""Alt-Svc: h2=":443"; ma=2592000; persist=1"""))
+        check(f.body_len == 54)
+        check(f.stream_id == 1)
     test "Short altsvc frame errors":
         expect InvalidFrameError:
             discard decode_frame(payload_with_origin[0..<12])
@@ -536,49 +554,49 @@ suite "Extension Frame test suite":
         let f = newExtensionFrame(0xFF, 1, 42, cast[seq[byte]]("hello"))
         check(($f).endsWith "type=255, flag_byte=42, body=<hex:68656C6C6F>")
 
-suite "Headers Frame test suite":
-    test "repr":
-        var f = newHeadersFrame(1)
-        check(($f).endsWith "exclusive=false, depends_on=0, stream_weight=0, data=nil")
-        f = newHeadersFrame(1, exclusive = true, depends_on = 42, stream_weight = 64, data = cast[seq[byte]]("hello"))
-        check(($f).endsWith "exclusive=false, depends_on=42, stream_weight=64, data=<hex:68656C6C6F>")
-    test "Headers frame flags":
-        let f = newHeadersFrame(1)
-        let flags = f.parse_flags(0xFF)
-        check(flags.len == 4)
-        check(all(@["END_STREAM", "END_HEADERS", "PADDED", "PRIORITY"], proc(fl: string) : bool = fl in flags))
-    test "Headers frame serializes properly":
-        let f = newHeadersFrame(1, data = cast[seq[byte]]("hello world"), flags = @["END_STREAM", "END_HEADERS"])
-        check(f.serialize == cast[seq[byte]]("\x00\x00\x0B\x01\x05\x00\x00\x00\x01hello world"))
-    test "Headers frame parses properly":
-        let s = cast[seq[byte]]("\x00\x00\x0B\x01\x05\x00\x00\x00\x01hello world")
-        let f = decode_frame(s)
-        check(f.typ.get == HeadersFrameType)
-        check(f.flags.len == 2)
-        check(all(@["END_STREAM", "END_HEADERS"], proc(fl: string) : bool = fl in f.flags))
-        check(HeadersFrame(f).data == cast[seq[byte]]("hello world"))
-        check(f.body_len == 11)
-    test "Headers frame with priority parses properly":
-        let s = cast[seq[byte]]("\x00\x00\x05\x01\x20\x00\x00\x00\x01\x80\x00\x00\x04\x40")
-        let f = decode_frame(s)
-        check(f.typ.get == HeadersFrameType)
-        check(f.flags.len == 1)
-        check("PRIORITY" in f.flags)
-        check(HeadersFrame(f).data == newSeqOfCap[byte](0))
-        check(HeadersFrame(f).depends_on == 4)
-        check(HeadersFrame(f).stream_weight == 64)
-        check(HeadersFrame(f).exclusive)
-        check(f.body_len == 5)
-    test "Headers frame with priority serializes properly":
-        let s = cast[seq[byte]]("\x00\x00\x05\x01\x20\x00\x00\x00\x01\x80\x00\x00\x04\x40")
-        let f = newHeadersFrame(1, exclusive = true, depends_on = 4, stream_weight = 64, flags = @["PRIORITY"])
-        check(f.serialize == s)
-    test "Headers frame with invalid padding fails to parse":
-        let data = cast[seq[byte]]("\x00\x00\x05\x01\x08\x00\x00\x00\x01\x06\x54\x65\x73\x74")
-        expect InvalidPaddingError:
-            discard decode_frame(data)
-    test "Headers frame with no length parses":
-        let f = newHeadersFrame(1)
-        let data = f.serialize
-        let new_frame = decode_frame(data)
-        check(HeadersFrame(new_frame).data == newSeqOfCap[byte](0))
+# suite "Headers Frame test suite":
+#     test "repr":
+#         var f = newHeadersFrame(1)
+#         check(($f).endsWith "exclusive=false, depends_on=0, stream_weight=0, data=nil")
+#         f = newHeadersFrame(1, exclusive = true, depends_on = 42, stream_weight = 64, data = cast[seq[byte]]("hello"))
+#         check(($f).endsWith "exclusive=true, depends_on=42, stream_weight=64, data=<hex:68656C6C6F>")
+#     test "Headers frame flags":
+#         let f = newHeadersFrame(1)
+#         let flags = f.parse_flags(0xFF)
+#         check(flags.len == 4)
+#         check(all(@["END_STREAM", "END_HEADERS", "PADDED", "PRIORITY"], proc(fl: string) : bool = fl in flags))
+#     test "Headers frame serializes properly":
+#         let f = newHeadersFrame(1, data = cast[seq[byte]]("hello world"), flags = @["END_STREAM", "END_HEADERS"])
+#         check(f.serialize == cast[seq[byte]]("\x00\x00\x0B\x01\x05\x00\x00\x00\x01hello world"))
+#     test "Headers frame parses properly":
+#         let s = cast[seq[byte]]("\x00\x00\x0B\x01\x05\x00\x00\x00\x01hello world")
+#         let f = decode_frame(s)
+#         check(f.typ.get == HeadersFrameType)
+#         check(f.flags.len == 2)
+#         check(all(@["END_STREAM", "END_HEADERS"], proc(fl: string) : bool = fl in f.flags))
+#         check(HeadersFrame(f).data == cast[seq[byte]]("hello world"))
+#         check(f.body_len == 11)
+#     test "Headers frame with priority parses properly":
+#         let s = cast[seq[byte]]("\x00\x00\x05\x01\x20\x00\x00\x00\x01\x80\x00\x00\x04\x40")
+#         let f = decode_frame(s)
+#         check(f.typ.get == HeadersFrameType)
+#         check(f.flags.len == 1)
+#         check("PRIORITY" in f.flags)
+#         check(HeadersFrame(f).data == newSeqOfCap[byte](0))
+#         check(HeadersFrame(f).depends_on == 4)
+#         check(HeadersFrame(f).stream_weight == 64)
+#         check(HeadersFrame(f).exclusive)
+#         check(f.body_len == 5)
+#     test "Headers frame with priority serializes properly":
+#         let s = cast[seq[byte]]("\x00\x00\x05\x01\x20\x00\x00\x00\x01\x80\x00\x00\x04\x40")
+#         let f = newHeadersFrame(1, exclusive = true, depends_on = 4, stream_weight = 64, flags = @["PRIORITY"])
+#         check(f.serialize == s)
+#     test "Headers frame with invalid padding fails to parse":
+#         let data = cast[seq[byte]]("\x00\x00\x05\x01\x08\x00\x00\x00\x01\x06\x54\x65\x73\x74")
+#         expect InvalidPaddingError:
+#             discard decode_frame(data)
+#     test "Headers frame with no length parses":
+#         let f = newHeadersFrame(1)
+#         let data = f.serialize
+#         let new_frame = decode_frame(data)
+#         check(HeadersFrame(new_frame).data == newSeqOfCap[byte](0))
