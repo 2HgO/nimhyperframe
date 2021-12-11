@@ -13,6 +13,36 @@ proc decode_frame(data: seq[byte]) : Frame =
     doAssert 9+length == data.len
     return f
 
+proc dup(oldfd: FileHandle): FileHandle {.importc, header: "unistd.h".}
+proc dup2(oldfd: FileHandle, newfd: FileHandle): cint {.importc, header: "unistd.h".}
+
+# Dummy filename
+let tmpFileName = "/tmp/temp_output.txt"
+
+template captureStdout*(res: untyped, body: untyped) =
+    var stdout_fileno = stdout.getFileHandle()
+    # Duplicate stoud_fileno
+    var stdout_dupfd = dup(stdout_fileno)
+    # Create a new file
+    # You can use append strategy if you'd like
+    var tmp_file: File = open(tmpFileName, fmWrite)
+    # Get the FileHandle (the file descriptor) of your file
+    var tmp_file_fd: FileHandle = tmp_file.getFileHandle()
+    # dup2 tmp_file_fd to stdout_fileno -> writing to stdout_fileno now writes to tmp_file
+    discard dup2(tmp_file_fd, stdout_fileno)
+    #
+    body
+    # Force flush
+    tmp_file.flushFile()
+    # Close tmp
+    tmp_file.close()
+
+    res = readFile(tmpFileName)
+
+    # Restore stdout
+    discard dup2(stdout_dupfd, stdout_fileno)
+
+
 type
     SerializableFrameWithShortData = ref object of Frame
     SerializableFrameWithLongData = ref object of Frame
@@ -25,20 +55,21 @@ suite "General frame behaviour test suite":
         block:
             var frame: Frame = new SerializableFrameWithShortData
             initFrame(frame, 0)
-            checkpoint $frame
             check(($frame) == "Frame(stream_id=0, flags=@[]): <hex:626F6479>")
         block:
             var frame: Frame = new SerializableFrameWithLongData
             initFrame(frame, 42)
-            checkpoint $frame
             check(($frame) == "Frame(stream_id=42, flags=@[]): <hex:" & repeat("41", 10) & "...>")
-        
+    test "Frame explain":
+        let data = cast[seq[byte]]("\x00\x00\x08\x00\x01\x00\x00\x00\x01testdata")
+        var output: string
+        captureStdout(output):
+            discard explain(data)
+        check(output.strip == "DataFrame(stream_id=1, flags=@[\"END_STREAM\"]): <hex:7465737464617461>")
     test "Base frame ignores flags":
         var f = new(Frame)
         initFrame(f, 0)
-        checkpoint $f[]
         var flags = f.parse_flags(0xFF.uint8)
-        checkpoint flags
         check(flags.len == 0)
     test "Base frame cannot serialize":
         var f = new(Frame)
@@ -253,8 +284,6 @@ suite "Settings Frame test suite":
         let f = newSettingsFrame(settings = settings)
         discard f.parse_flags(0xFF)
         let s = f.serialize
-        checkpoint s
-        checkpoint serialized
         check(s == serialized)
     test "Settings frame with settings":
         let f = newSettingsFrame(settings = settings)
@@ -301,7 +330,6 @@ suite "Push Promise Frame test suite":
     test "Push promise frame serializes properly":
         let f = newPushPromiseFrame(1, promised_stream_id = 4, data = cast[seq[byte]]("hello world"), flags = @["END_HEADERS"])
         let s = f.serialize
-        echo s
         check(s == cast[seq[byte]]("\x00\x00\x0F\x05\x04\x00\x00\x00\x01\x00\x00\x00\x04hello world"))
     test "Push promise frame parses properly":
         let s = cast[seq[byte]]("\x00\x00\x0F\x05\x04\x00\x00\x00\x01\x00\x00\x00\x04hello world")

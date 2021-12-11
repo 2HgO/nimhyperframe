@@ -345,7 +345,6 @@ method parse_body(s: SettingsFrame, data: seq[byte]) {.locks: "unknown".} =
         let unpacked = try:
             STRUCT_HL.unpack(cast[string](data[i..<min(i+6, high(data)+1)]))
         except ValueError:
-            echo getCurrentExceptionMsg()
             raise newException(InvalidFrameError, "Invalid SETTINGS body")
         s.settings[newSetting(unpacked[0].getShort)] = unpacked[1].getUInt
         body_len += 6
