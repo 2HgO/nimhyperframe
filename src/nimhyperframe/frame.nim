@@ -62,7 +62,7 @@ proc newSettingsFrame*(stream_id: uint32 = 0; settings: OrderedTable[Settings, u
 proc newPushPromiseFrame*(stream_id: uint32; promised_stream_id: uint32 = 0; data: seq[byte] = @[], pad_length: uint32 = 0; flags: seq[string] = @[]) : Frame
 proc newPriorityFrame*(stream_id: uint32; depends_on: uint32 = 0, stream_weight: uint8 = 0, exclusive: bool = false; flags: seq[string] = @[]) : Frame
 proc newRstStreamFrame*(stream_id: uint32; error_code: uint32 = 0; flags: seq[string] = @[]) : Frame
-proc newPingFrame*(stream_id: uint32; opaque_data: seq[byte] = @[], flags: seq[string] = @[]) : Frame
+proc newPingFrame*(stream_id: uint32 = 0; opaque_data: seq[byte] = @[], flags: seq[string] = @[]) : Frame
 proc newExtensionFrame*(frame_type: uint8; stream_id: uint32; flag_byte: uint8 = 0; body: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
 proc newGoAwayFrame*(stream_id: uint32 = 0; last_stream_id: uint32 = 0; error_code: uint32 = 0; additional_data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
 proc newWindowUpdateFrame*(stream_id: uint32; window_increment: uint32 = 0; flags: seq[string] = @[]) : Frame
@@ -127,24 +127,24 @@ proc parse_from_header*(header: seq[byte]; strict: bool = false) : tuple[frame: 
     let typ = fields[2].getChar.uint8
     let flags = fields[3].getChar.uint8
     let stream_id = fields[4].getUInt and 0x7FFFFFFF'u32
-    var frame = try:
-        case FrameType(typ)
-        of DataFrameType: newDataFrame(stream_id)
-        of HeadersFrameType: newHeadersFrame(stream_id)
-        of PingFrameType: newPingFrame(stream_id)
-        of PriorityFrameType: newPriorityFrame(stream_id)
-        of RstStreamFrameType: newRstStreamFrame(stream_id)
-        of SettingsFrameType: newSettingsFrame(stream_id)
-        of PushPromiseFrameType: newPushPromiseFrame(stream_id)
-        of GoAwayFrameType: newGoAwayFrame(stream_id)
+    var frame = case typ:
+        of 0x00'u8..0xA'u8:
+            case FrameType(typ)
+            of DataFrameType: newDataFrame(stream_id)
+            of HeadersFrameType: newHeadersFrame(stream_id)
+            of PingFrameType: newPingFrame(stream_id)
+            of PriorityFrameType: newPriorityFrame(stream_id)
+            of RstStreamFrameType: newRstStreamFrame(stream_id)
+            of SettingsFrameType: newSettingsFrame(stream_id)
+            of PushPromiseFrameType: newPushPromiseFrame(stream_id)
+            of GoAwayFrameType: newGoAwayFrame(stream_id)
+            of AltSvcFrameType: newAltSvcFrame(stream_id)
+            of ContinuationFrameType: newContinuationFrame(stream_id)
+            of WindowUpdateFrameType: newWindowUpdateFrame(stream_id)
         else:
             if strict:
                 raise newUnknownFrameError(typ, length)
             newExtensionFrame(typ, stream_id)
-    except:
-        if strict:
-            raise newUnknownFrameError(typ, length)
-        newExtensionFrame(typ, stream_id)
     frame.parse_flags(flags)
     return (frame: frame, length: length.int)
 
@@ -239,7 +239,7 @@ proc pad_length*(d: DataFrame) : uint32 {.inline.} = result = d.pad_length
 
 method serialize_body(d: DataFrame) : seq[byte] {.locks: "unknown".} =
     result.add d.serialize_padding_data
-    result.add d.data
+    result.add move d.data
     result.add newSeq[byte](d.pad_length)
 method parse_body(d: DataFrame, data: seq[byte]) {.locks: "unknown".} =
     let padding_data_length = d.parse_padding_data(data)
@@ -381,7 +381,7 @@ method body_repr(p: PushPromiseFrame) : string {.inline, locks: "unknown".} =
 method serialize_body(p: PushPromiseFrame) : seq[byte] {.locks: "unknown".} =
     result.add p.serialize_padding_data()
     result.add cast[seq[byte]](STRUCT_L.pack(p.promised_stream_id))
-    result.add p.data
+    result.add move p.data
     result.add newSeq[byte](p.pad_length)
 method parse_body(p: PushPromiseFrame, data: seq[byte]) {.locks: "unknown".} =
     let padding_data_length = p.parse_padding_data(data)
@@ -400,7 +400,7 @@ type
     PingFrame* = ref PingFrameObj
     PingFrameObj = object of Frame
         opaque_data: seq[byte]
-proc newPingFrame*(stream_id: uint32; opaque_data: seq[byte] = @[], flags: seq[string] = @[]) : Frame =
+proc newPingFrame*(stream_id: uint32 = 0; opaque_data: seq[byte] = @[], flags: seq[string] = @[]) : Frame =
     result = new(PingFrame)
     result.typ = PingFrameType.some
     result.name = "PingFrame"
@@ -465,9 +465,8 @@ method serialize(e: ExtensionFrame) : seq[byte] {.locks: "unknown".} =
         flags.char,
         e.stream_id and 0x7FFFFFFF
     )
-
     result.add cast[seq[byte]](header)
-    result.add e.body
+    result.add move e.body
 
 type
     GoAwayFrame* = ref GoAwayFrameObj
@@ -491,13 +490,13 @@ proc newGoAwayFrame*(stream_id: uint32 = 0; last_stream_id: uint32 = 0; error_co
     GoAwayFrame(result).additional_data = additional_data
 
 method body_repr(g: GoAwayFrame) : string {.inline, locks: "unknown".} =
-    result = "last_stream_id=" & $g.stream_id & ", error_code=" & $g.error_code & ", additional_data=" & cast[string](g.additional_data) 
+    result = "last_stream_id=" & $g.last_stream_id & ", error_code=" & $g.error_code & ", additional_data=" & cast[string](g.additional_data) 
 method serialize_body(g: GoAwayFrame) : seq[byte] {.locks: "unknown".} =
     result = cast[seq[byte]](STRUCT_LL.pack(
         g.last_stream_id and 0x7FFFFFFF,
         g.error_code
     ))
-    result.add g.additional_data
+    result.add move g.additional_data
 method parse_body(g: GoAwayFrame, data: seq[byte]) {.locks: "unknown".} =
     let unpacked = try:
         STRUCT_LL.unpack(cast[string](data[0..<min(8, high(data)+1)]))
@@ -584,8 +583,8 @@ method body_repr(a: AltSvcFrame) : string {.inline, locks: "unknown".} =
     return "origin=" & cast[string](a.origin) & ", field=" & cast[string](a.field)
 method serialize_body(a: AltSvcFrame) : seq[byte] {.locks: "unknown".} =
     result = cast[seq[byte]](STRUCT_H.pack(a.origin.len))
-    result.add a.origin
-    result.add a.field
+    result.add move a.origin
+    result.add move a.field
 method parse_body(a: AltSvcFrame, data: seq[byte]) {.locks: "unknown".} =
     try:
         let origin_len = STRUCT_H.unpack(cast[string](data[0..<min(2, high(data)+1)]))[0].getShort
@@ -638,7 +637,7 @@ method serialize_body(h: HeadersFrame) : seq[byte] {.locks: "unknown".} =
     result = h.serialize_padding_data
     if "PRIORITY" in h.flags:
         result.add h.serialize_priority_data
-    result.add h.data
+    result.add move h.data
     result.add newSeq[byte](h.pad_length)
 method parse_body(h: HeadersFrame, data: seq[byte]) {.locks: "unknown".} =
     let padding_data_len = h.parse_padding_data(data)

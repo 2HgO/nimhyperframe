@@ -3,6 +3,7 @@ import options
 import sequtils
 import strutils
 import tables
+import math
 
 import nimhyperframe
 
@@ -64,7 +65,7 @@ suite "General frame behaviour test suite":
         let frame_data = cast[seq[byte]]("\x00\x00\x0C\xFF\x00\x00\x00\x00\x01hello world!")
         let frame = decode_frame(frame_data)
         check(frame.serialize() == frame_data)
-    test "Cannot parse invalid header":
+    test "Cannot parse invalid frame header":
         expect InvalidFrameError:
             discard parse_from_header(cast[seq[byte]]("\x00\x00\x08\x00\x01\x00\x00\x00"))
 
@@ -208,7 +209,8 @@ suite "Settings Frame test suite":
         "\x00\x04\x00\x00\xFF\xFF" &              # INITIAL_WINDOW_SIZE
         "\x00\x05\x00\x00\x40\x00" &              # MAX_FRAME_SIZE
         "\x00\x06\x00\x00\xFF\xFF" &              # MAX_HEADER_LIST_SIZE
-        "\x00\x08\x00\x00\x00\x01")                # ENABLE_CONNECT_PROTOCOL
+        "\x00\x08\x00\x00\x00\x01"                # ENABLE_CONNECT_PROTOCOL
+    )
     let settings = {
         HEADER_TABLE_SIZE: 4096'u32,
         ENABLE_PUSH: 0'u32,
@@ -269,7 +271,6 @@ suite "Push Promise Frame test suite":
         var f = newPushPromiseFrame(1)
         check(($f).endsWith "promised_stream_id=0, data=nil")
         f = newPushPromiseFrame(1, promised_stream_id = 4, data = cast[seq[byte]]("testdata"))
-        checkpoint $f
         check(($f).endsWith "promised_stream_id=4, data=<hex:7465737464617461>")
 
     test "Push promise frame flags":
@@ -323,3 +324,173 @@ suite "Push Promise Frame test suite":
         let s = cast[seq[byte]]("\x00\x00\x0F\x05\x04\x00\x00\x00\x01\x00\x00\x00")
         expect InvalidFrameError:
             discard decode_frame(s)
+
+suite "Ping Frame test suite":
+    test "repr":
+        var f = newPingFrame()
+        check(($f).endsWith "opaque_data=")
+        f = newPingFrame(opaque_data = cast[seq[byte]]("hello"))
+        check(($f).endsWith "opaque_data=hello")
+    test "Ping frame has only one flag":
+        let f = newPingFrame()
+        let flags = f.parse_flags(0xFF)
+        check(flags.len == 1)
+        check("ACK" in flags)
+    test "Ping frame serializes properly":
+        let f = newPingFrame(opaque_data = @['\x01'.byte, '\x02'.byte])
+        discard f.parse_flags(0xFF)
+        let s = f.serialize
+        check(s == cast[seq[byte]]("\x00\x00\x08\x06\x01\x00\x00\x00\x00\x01\x02\x00\x00\x00\x00\x00\x00"))
+    test "No more than 8 octets":
+        let f = newPingFrame(opaque_data = cast[seq[byte]]("\x01\x02\x03\x04\x05\x06\x07\x08\x09"))
+        expect InvalidFrameError:
+            discard f.serialize
+    test "Ping frame parses properly":
+        let s = cast[seq[byte]]("\x00\x00\x08\x06\x01\x00\x00\x00\x00\x01\x02\x00\x00\x00\x00\x00\x00")
+        let f = decode_frame(s)
+        check(f.typ.get == PingFrameType)
+        check("ACK" in f.flags)
+        check(f.flags.len == 1)
+        check(PingFrame(f).opaque_data == cast[seq[byte]]("\x01\x02\x00\x00\x00\x00\x00\x00"))
+        check(f.body_len == 8)
+    test "Ping frame never has a stream":
+        expect InvalidDataError:
+            discard newPingFrame(1)
+    test "Ping frame has no more than body length 8":
+        let f = newPingFrame()
+        expect InvalidFrameError:
+            f.parse_body(cast[seq[byte]]("\x01\x02\x03\x04\x05\x06\x07\x08\x09"))
+    test "Ping frame has no less than body length 8":
+        let f = newPingFrame()
+        expect InvalidFrameError:
+            f.parse_body(cast[seq[byte]]("\x01\x02\x03\x04\x05\x06\x07"))
+
+suite "GoAway Frame test suite":
+    test "repr":
+        var f = newGoAwayFrame()
+        check(($f).endsWith "last_stream_id=0, error_code=0, additional_data=")
+        f = newGoAwayFrame(last_stream_id=64, error_code=32, additional_data=cast[seq[byte]]("hello"))
+        check(($f).endsWith "last_stream_id=64, error_code=32, additional_data=hello")
+    test "GoAway frame has no flags":
+        let f = newGoAwayFrame()
+        let flags = f.parse_flags(0xFF)
+
+        check(flags.len == 0)
+    test "GoAway frame serializes properly":
+        let f = newGoAwayFrame(last_stream_id=64, error_code=32, additional_data=cast[seq[byte]]("hello"))
+        check(f.serialize == cast[seq[byte]]("\x00\x00\x0D\x07\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x20hello"))
+    test "GoAway frame parses properly":
+        var s = cast[seq[byte]]("\x00\x00\x0D\x07\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x20hello")
+        var f = decode_frame(s)
+        check(f.flags.len == 0)
+        check(GoAwayFrame(f).additional_data == cast[seq[byte]]("hello"))
+        check(f.body_len == 13)
+
+        s = cast[seq[byte]]("\x00\x00\x08\x07\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x20")
+        f = decode_frame(s)
+        check(f.flags.len == 0)
+        check(GoAwayFrame(f).additional_data == newSeqOfCap[byte](0))
+        check(f.body_len == 8)
+    test "GoAway frame never has a stream":
+        expect InvalidDataError:
+            discard newGoAwayFrame(1)
+    test "Short goaway frame errors":
+        let s = cast[seq[byte]]("\x00\x00\x0D\x07\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00")
+        expect InvalidFrameError:
+            discard decode_frame(s)
+
+
+suite "Window Update Frame test suite":
+    test "repr":
+        var f = newWindowUpdateFrame(0)
+        check(($f).endsWith "window_increment=0")
+        f = newWindowUpdateFrame(1, window_increment=512)
+        check(($f).endsWith "window_increment=512")
+    test "GoAway frame has no flags":
+        let f = newWindowUpdateFrame(0)
+        let flags = f.parse_flags(0xFF)
+        check(flags.len == 0)
+    test "Window Update frame serializes properly":
+        let f = newWindowUpdateFrame(0, window_increment=512)
+        check(f.serialize == cast[seq[byte]]("\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00"))
+    test "Window Update frame parses properly":
+        let s = cast[seq[byte]]("\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00")
+        let f = decode_frame(s)
+        check(f.flags.len == 0)
+        check(WindowUpdateFrame(f).window_increment == 512)
+        check(f.body_len == 4)
+    test "Short window update frame errors":
+        var s = cast[seq[byte]]("\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02")
+        expect InvalidFrameError:
+            discard decode_frame(s)
+        s = cast[seq[byte]]("\x00\x00\x05\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
+        expect InvalidFrameError:
+            discard decode_frame(s)
+        expect InvalidDataError:
+            discard decode_frame(newWindowUpdateFrame(0).serialize)
+        expect InvalidDataError:
+            discard decode_frame(newWindowUpdateFrame((2^31).uint32).serialize)
+
+suite "Continuation Frame test suite":
+    test "repr":
+        var f = newContinuationFrame(1)
+        check(($f).endsWith "data=nil")
+        f = newContinuationFrame(1, data=cast[seq[byte]]("hello"))
+        check(($f).endsWith "data=<hex:68656C6C6F>")
+    test "Continuation frame flags":
+        let f = newContinuationFrame(1)
+        discard f.parse_flags(0xFF)
+        check(f.flags.len == 1)
+        check("END_HEADERS" in f.flags)
+    test "Continuation frame serializes":
+        let f = newContinuationFrame(1, data=cast[seq[byte]]("hello world"))
+        discard f.parse_flags(0x04)
+        check(f.serialize == cast[seq[byte]]("\x00\x00\x0B\x09\x04\x00\x00\x00\x01hello world"))
+    test "Continuation frame parses properly":
+        let s = cast[seq[byte]]("\x00\x00\x0B\x09\x04\x00\x00\x00\x01hello world")
+        let f = decode_frame(s)
+
+        check(f.typ.get == ContinuationFrameType)
+        check(f.flags.len == 1)
+        check("END_HEADERS" in f.flags)
+        check(ContinuationFrame(f).data == cast[seq[byte]]("hello world"))
+        check(f.body_len == 11)
+
+suite "AltSvs Frame test suite":
+    let payload_with_origin = cast[seq[byte]](
+        "\x00\x00\x31" &  # Length
+        "\x0A" &  # Type
+        "\x00" &  # Flags
+        "\x00\x00\x00\x00" &  # Stream ID
+        "\x00\x0B" &  # Origin len
+        "example.com" &  # Origin
+        """h2="alt.example.com:8000", h2=":443""""  # Field Value
+    )
+    let payload_without_origin = cast[seq[byte]](
+        "\x00\x00\x13" &  # Length
+        "\x0A" &  # Type
+        "\x00" &  # Flags
+        "\x00\x00\x00\x01" &  # Stream ID
+        "\x00\x00" &  # Origin len
+        "" &  # Origin
+        """h2=":8000"; ma=60"""  # Field Value
+    )
+    let payload_with_origin_and_stream = cast[seq[byte]](
+        "\x00\x00\x36" &  # Length
+        "\x0A" &  # Type
+        "\x00" &  # Flags
+        "\x00\x00\x00\x01" &  # Stream ID
+        "\x00\x0B" &  # Origin len
+        "example.com" &  # Origin
+        """Alt-Svc: h2=":443"; ma=2592000; persist=1"""  # Field Value
+    )
+    test "repr":
+        var f = newAltSvcFrame(0)
+        check(($f).endsWith "origin=, field=")
+        f = newAltSvcFrame(0, field = cast[seq[byte]]("""h2="alt.example.com:8000", h2=":443""""))
+        check(($f).endsWith """origin=, field=h2="alt.example.com:8000", h2=":443"""")
+        f = newAltSvcFrame(0, field = cast[seq[byte]]("""h2="alt.example.com:8000", h2=":443""""), origin = cast[seq[byte]]("""example.com"""))
+        check(($f).endsWith """origin=example.com, field=h2="alt.example.com:8000", h2=":443"""")
+
+
+
