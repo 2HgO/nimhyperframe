@@ -33,6 +33,9 @@ type
         SettingsFrameType=0x04'u8
         PushPromiseFrameType=0x05'u8
         PingFrameType=0x06'u8
+        GoAwayFrameType=0x07'u8
+        WindowUpdateFrameType=0x08'u8
+        ContinuationFrameType=0x09'u8
     Settings* = enum
         HEADER_TABLE_SIZE = 0x01'u16 ## The byte that signals the SETTINGS_HEADER_TABLE_SIZE setting.
         ENABLE_PUSH = 0x02'u16 ## The byte that signals the SETTINGS_ENABLE_PUSH setting.
@@ -60,6 +63,9 @@ proc newPriorityFrame*(stream_id: uint32; depends_on: uint32 = 0, stream_weight:
 proc newRstStreamFrame*(stream_id: uint32; error_code: uint32 = 0; flags: seq[string] = @[]) : Frame
 proc newPingFrame*(stream_id: uint32; opaque_data: seq[byte] = @[], flags: seq[string] = @[]) : Frame
 proc newExtensionFrame*(frame_type: uint8; stream_id: uint32; flag_byte: uint8 = 0; body: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
+proc newGoAwayFrame*(stream_id: uint32 = 0; last_stream_id: uint32 = 0; error_code: uint32 = 0; additional_data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
+proc newWindowUpdateFrame*(stream_id: uint32; window_increment: uint32 = 0; flags: seq[string] = @[]) : Frame
+proc newContinuationFrame*(stream_id: uint32; data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame
 
 proc newSetting(f: int) : Settings {.inline.} =
     case f.uint8
@@ -102,7 +108,7 @@ method body_repr(f: Frame) : string {.base, locks: "unknown", inline.} = result 
 method `$`*(f: Frame) : string {.base.} =
     result = f.name & "(stream_id=" & $f.stream_id & ", flags=" & $f.flags & "): " & f.body_repr
 
-method parse_flags*(f: Frame, flag_byte: uint8) : Flags {.base, discardable.} =
+method parse_flags*(f: Frame, flag_byte: uint8) : Flags {.base, discardable, locks: "unknown".} =
     for (flag, flag_bit) in f.defined_flags.mitems:
         if (flag_byte and flag_bit) != 0:
             f.flags.add(flag)
@@ -126,6 +132,7 @@ proc parse_from_header*(header: seq[byte]; strict: bool = false) : tuple[frame: 
         of RstStreamFrameType: newRstStreamFrame(stream_id)
         of SettingsFrameType: newSettingsFrame(stream_id)
         of PushPromiseFrameType: newPushPromiseFrame(stream_id)
+        of GoAwayFrameType: newGoAwayFrame(stream_id)
         else:
             if strict:
                 raise newUnknownFrameError(typ, length)
@@ -160,12 +167,11 @@ proc explain*(data: seq[byte]) : tuple[frame: Frame, length: int] =
     return (frame: frame, length: length)
 
 type
-    Padding* = ref PaddingObj
-    PaddingObj = object of Frame
-        pad_length: uint32
+    Padding* = concept p
+        p.flags is Flags
+        p.pad_length is uint32
 
-method pad_length*(p: Padding) : uint32 {.base, inline.} = result = p.pad_length
-method parse_padding_data*(p: Padding, data: seq[byte]) : int {.base, discardable.} =
+proc parse_padding_data*(p: Padding, data: seq[byte]) : int {.discardable.} =
     if "PADDED" in p.flags:
         p.pad_length = try:
             unpack("!b", cast[string](data[0..<min(1, high(data)+1)]))[0].getChar.uint8
@@ -173,28 +179,23 @@ method parse_padding_data*(p: Padding, data: seq[byte]) : int {.base, discardabl
             raise newException(InvalidFrameError, "Invalid Padding data")
         return 1
     return 0
-method serialize_padding_data*(p: Padding) : seq[byte] {.base.} =
+proc serialize_padding_data*(p: Padding) : seq[byte] =
     if "PADDED" in p.flags:
         return cast[seq[byte]](STRUCT_B.pack(p.pad_length.char))
     return @[]
 
 type
-    Priority* = ref PriorityObj
-    PriorityObj = object of Frame
-        depends_on: uint32
-        stream_weight: uint8
-        exclusive: bool
+    Priority* = concept p
+        p.depends_on is uint32
+        p.stream_weight is uint8
+        p.exclusive is bool
 
-proc depends_on*(p: Priority) : uint32 {.inline.} = p.depends_on
-proc stream_weight*(p: Priority) : uint8 {.inline.} = p.stream_weight
-proc exclusive*(p: Priority) : bool {.inline.} = p.exclusive
-
-method serialize_priority_data*(p: Priority) : seq[byte] {.base.} = 
+proc serialize_priority_data*(p: Priority) : seq[byte] = 
     return cast[seq[byte]](STRUCT_LB.pack(
         p.depends_on + (if p.exclusive: 0x80000000'u32 else: 0'u32),
         p.stream_weight.char
     ))
-method parse_priority_data*(p: Priority, data: seq[byte]) : int {.base, discardable.} =
+proc parse_priority_data*(p: Priority, data: seq[byte]) : int {.discardable.} =
     let up = try:
         STRUCT_LB.unpack(cast[string](data[0..<min(5, high(data)+1)]))
     except ValueError:
@@ -206,7 +207,8 @@ method parse_priority_data*(p: Priority, data: seq[byte]) : int {.base, discarda
 
 type
     DataFrame* = ref DataFrameObj
-    DataFrameObj = object of Padding
+    DataFrameObj = object of Frame
+        pad_length: uint32
         data: seq[byte]
 
 proc newDataFrame*(stream_id: uint32; data: seq[byte] = @[], pad_length: uint32 = 0; flags: seq[string] = @[]) : Frame =
@@ -219,7 +221,7 @@ proc newDataFrame*(stream_id: uint32; data: seq[byte] = @[], pad_length: uint32 
     ]
     result.stream_association = STREAM_ASSOC_HAS_STREAM.some
     initFrame(result, stream_id, flags)
-    Padding(result).pad_length = pad_length
+    DataFrame(result).pad_length = pad_length
     DataFrame(result).data = data
 
 proc flow_controlled_length*(d: DataFrame) : uint32 =
@@ -229,12 +231,13 @@ proc flow_controlled_length*(d: DataFrame) : uint32 =
     return d.data.len.uint32 + padding_len
 
 proc data*(d: DataFrame) : seq[byte] {.inline.} = d.data
+proc pad_length*(d: DataFrame) : uint32 {.inline.} = result = d.pad_length
 
-method serialize_body*(d: DataFrame) : seq[byte] =
+method serialize_body(d: DataFrame) : seq[byte] {.locks: "unknown".} =
     result.add d.serialize_padding_data
     result.add d.data
     result.add newSeq[byte](d.pad_length)
-method parse_body*(d: DataFrame, data: seq[byte]) =
+method parse_body(d: DataFrame, data: seq[byte]) {.locks: "unknown".} =
     let padding_data_length = d.parse_padding_data(data)
 
     d.data = data[padding_data_length..<min(data.len - d.pad_length.int, high(data)+1)]
@@ -244,7 +247,10 @@ method parse_body*(d: DataFrame, data: seq[byte]) =
 
 type
     PriorityFrame* = ref PriorityFrameObj
-    PriorityFrameObj = object of Priority
+    PriorityFrameObj = object of Frame
+        depends_on: uint32
+        stream_weight: uint8
+        exclusive: bool
 
 proc newPriorityFrame*(stream_id: uint32; depends_on: uint32 =0 , stream_weight: uint8 = 0, exclusive: bool = false; flags: seq[string] = @[]) : Frame =
     result = new(PriorityFrame)
@@ -252,15 +258,19 @@ proc newPriorityFrame*(stream_id: uint32; depends_on: uint32 =0 , stream_weight:
     result.name = "PriorityFrame"
     result.stream_association = STREAM_ASSOC_HAS_STREAM.some
     initFrame(result, stream_id, flags)
-    Priority(result).depends_on = depends_on
-    Priority(result).stream_weight = stream_weight
-    Priority(result).exclusive = exclusive
+    PriorityFrame(result).depends_on = depends_on
+    PriorityFrame(result).stream_weight = stream_weight
+    PriorityFrame(result).exclusive = exclusive
+
+proc depends_on*(p: PriorityFrame) : uint32 {.inline.} = p.depends_on
+proc stream_weight*(p: PriorityFrame) : uint8 {.inline.} = p.stream_weight
+proc exclusive*(p: PriorityFrame) : bool {.inline.} = p.exclusive
 
 method body_repr(p: PriorityFrame) : string {.inline, locks: "unknown".} =
     return "exclusive=" & $p.exclusive & ", depends_on=" & $p.depends_on & ", stream_weight=" & $p.stream_weight
-method serialize_body*(p: PriorityFrame) : seq[byte] {.inline, locks: "unknown".} =
+method serialize_body(p: PriorityFrame) : seq[byte] {.inline, locks: "unknown".} =
     result = p.serialize_priority_data()
-method parse_body*(p: PriorityFrame, data: seq[byte]) {.locks: "unknown".} =
+method parse_body(p: PriorityFrame, data: seq[byte]) {.locks: "unknown".} =
     if data.len > 5:
         raise newException(InvalidFrameError, "PRIORITY must have 5 byte body: actual length " & $data.len & ".")
     p.parse_priority_data(data)
@@ -284,9 +294,9 @@ proc error_code*(r: RstStreamFrame) : uint32 {.inline.} = r.error_code
 
 method body_repr(r: RstStreamFrame) : string {.inline, locks: "unknown".} =
     return "error_code=" & $r.error_code
-method serialize_body*(r: RstStreamFrame) : seq[byte] {.inline, locks: "unknown".} =
+method serialize_body(r: RstStreamFrame) : seq[byte] {.inline, locks: "unknown".} =
     result = cast[seq[byte]](STRUCT_L.pack(r.error_code))
-method parse_body*(r: RstStreamFrame, data: seq[byte]) {.locks: "unknown".} =
+method parse_body(r: RstStreamFrame, data: seq[byte]) {.locks: "unknown".} =
     if data.len != 4:
         raise newException(InvalidFrameError, "RST_STREAM must have 4 byte body: actual length " & $data.len & ".")
     r.error_code = try:
@@ -319,11 +329,11 @@ proc settings*(s: SettingsFrame) : OrderedTable[Settings, uint32] {.inline.} = s
 
 method body_repr(p: SettingsFrame) : string {.inline, locks: "unknown".} =
     return "settings=" & $p.settings
-method serialize_body*(s: SettingsFrame) : seq[byte] {.locks: "unknown".} =
+method serialize_body(s: SettingsFrame) : seq[byte] {.locks: "unknown".} =
     result = @[]
     for setting, value in s.settings.pairs:
         result.add cast[seq[byte]](STRUCT_HL.pack(setting.uint16 and 0xFF, value))
-method parse_body*(s: SettingsFrame, data: seq[byte]) =
+method parse_body(s: SettingsFrame, data: seq[byte]) {.locks: "unknown".} =
     if "ACK" in s.flags and data.len > 0:
         raise newException(InvalidDataError, "SETTINGS ack frame must not have payload: got " & $data.len & " bytes")
     var body_len = 0
@@ -339,7 +349,8 @@ method parse_body*(s: SettingsFrame, data: seq[byte]) =
 
 type
     PushPromiseFrame* = ref PushPromiseFrameObj
-    PushPromiseFrameObj = object of Padding
+    PushPromiseFrameObj = object of Frame
+        pad_length: uint32
         data: seq[byte]
         promised_stream_id: uint32
 
@@ -353,21 +364,22 @@ proc newPushPromiseFrame*(stream_id: uint32; promised_stream_id: uint32 = 0; dat
     ]
     result.stream_association = STREAM_ASSOC_HAS_STREAM.some
     initFrame(result, stream_id, flags)
-    Padding(result).pad_length = pad_length
+    PushPromiseFrame(result).pad_length = pad_length
     PushPromiseFrame(result).data = data
     PushPromiseFrame(result).promised_stream_id = promised_stream_id
 
 proc data*(p: PushPromiseFrame) : seq[byte] {.inline.} = p.data
 proc promised_stream_id*(p: PushPromiseFrame) : uint32 {.inline.} = p.promised_stream_id
+proc pad_length*(p: PushPromiseFrame) : uint32 {.inline.} = result = p.pad_length
 
 method body_repr(p: PushPromiseFrame) : string {.inline, locks: "unknown".} =
     return "promised_stream_id=" & $p.promised_stream_id & ", data=" & raw_data_repr(p.data)
-method serialize_body*(p: PushPromiseFrame) : seq[byte] =
+method serialize_body(p: PushPromiseFrame) : seq[byte] {.locks: "unknown".} =
     result.add p.serialize_padding_data()
     result.add cast[seq[byte]](STRUCT_L.pack(p.promised_stream_id))
     result.add p.data
     result.add newSeq[byte](p.pad_length)
-method parse_body*(p: PushPromiseFrame, data: seq[byte]) =
+method parse_body(p: PushPromiseFrame, data: seq[byte]) {.locks: "unknown".} =
     let padding_data_length = p.parse_padding_data(data)
     p.promised_stream_id = try:
         STRUCT_L.unpack(cast[string](data[padding_data_length..<min(padding_data_length+4, high(data)+1)]))[0].getUInt
@@ -399,11 +411,11 @@ proc opaque_data*(p: PingFrame) : seq[byte] {.inline.} = p.opaque_data
 
 method body_repr(p: PingFrame) : string {.inline, locks: "unknown".} =
     return "opaque_data=" & cast[string](p.opaque_data)
-method serialize_body*(p: PingFrame) : seq[byte] {.locks: "unknown".} =
+method serialize_body(p: PingFrame) : seq[byte] {.locks: "unknown".} =
     if p.opaque_data.len > 8: raise newException(InvalidFrameError, "PING frame may not have more than 8 bytes of data, got "&cast[string](p.opaque_data))
     result = p.opaque_data
     for _ in 0..<8-p.opaque_data.len: result.add('\x00'.byte)
-method parse_body*(p: PingFrame, data: seq[byte]) {.locks: "unknown".} =
+method parse_body(p: PingFrame, data: seq[byte]) {.locks: "unknown".} =
     if data.len != 8:
         raise newException(InvalidFrameError, "PING frame must have 8 byte length: got " & cast[string](data))
     p.opaque_data = data
@@ -432,15 +444,15 @@ proc body*(e: ExtensionFrame) : seq[byte] {.inline.} = e.body
 method body_repr(e: ExtensionFrame) : string {.inline, locks: "unknown".} =
     result = "type=" & $e.frame_type & ", flag_byte=" & $e.flag_byte & ", body=" & raw_data_repr(e.body)
 
-method parse_body*(e: ExtensionFrame, data: seq[byte]) {.locks: "unknown".} =
+method parse_body(e: ExtensionFrame, data: seq[byte]) {.locks: "unknown".} =
     e.body = data
     e.body_len = data.len
 
-method parse_flags*(e: ExtensionFrame, flag_byte: uint8) : Flags {.discardable, locks: "unknown".} =
+method parse_flags(e: ExtensionFrame, flag_byte: uint8) : Flags {.discardable, locks: "unknown".} =
     e.flag_byte = flag_byte
     return result
 
-method serialize*(e: ExtensionFrame) : seq[byte] {.locks: "unknown".} =
+method serialize(e: ExtensionFrame) : seq[byte] {.locks: "unknown".} =
     let flags = e.flag_byte
     let header = STRUCT_HBBBL.pack(
         ((e.body_len shr 8) and 0xFFFF).uint16,
@@ -452,3 +464,96 @@ method serialize*(e: ExtensionFrame) : seq[byte] {.locks: "unknown".} =
 
     result.add cast[seq[byte]](header)
     result.add e.body
+
+type
+    GoAwayFrame* = ref GoAwayFrameObj
+    GoAwayFrameObj = object of Frame
+        last_stream_id: uint32
+        error_code: uint32
+        additional_data: seq[byte]
+
+proc last_stream_id*(g: GoAwayFrame) : uint32 {.inline.} = g.last_stream_id
+proc error_code*(g: GoAwayFrame) : uint32 {.inline.} = g.error_code
+proc additional_data*(g: GoAwayFrame) : seq[byte] {.inline.} = g.additional_data
+
+proc newGoAwayFrame*(stream_id: uint32 = 0; last_stream_id: uint32 = 0; error_code: uint32 = 0; additional_data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame =
+    result = new(GoAwayFrame)
+    result.typ = GoAwayFrameType.some
+    result.stream_association = STREAM_ASSOC_NO_STREAM.some
+    result.name = "GoAwayFrame"
+    initFrame(result, stream_id, flags)
+    GoAwayFrame(result).last_stream_id = last_stream_id
+    GoAwayFrame(result).error_code = error_code
+    GoAwayFrame(result).additional_data = additional_data
+
+method body_repr(g: GoAwayFrame) : string {.inline, locks: "unknown".} =
+    result = "last_stream_id=" & $g.stream_id & ", error_code=" & $g.error_code & ", additional_data=" & cast[string](g.additional_data) 
+method serialize_body(g: GoAwayFrame) : seq[byte] {.locks: "unknown".} =
+    result = cast[seq[byte]](STRUCT_LL.pack(
+        g.last_stream_id and 0x7FFFFFFF,
+        g.error_code
+    ))
+    result.add g.additional_data
+method parse_body(g: GoAwayFrame, data: seq[byte]) {.locks: "unknown".} =
+    let unpacked = try:
+        STRUCT_LL.unpack(cast[string](data[0..<min(8, high(data)+1)]))
+    except ValueError:
+        raise newException(InvalidFrameError, "Invalid GOAWAY body.")
+    g.last_stream_id = unpacked[0].getUInt
+    g.error_code = unpacked[1].getUInt
+    g.additional_data = data[min(high(data)+1, 8)..^1]
+    g.body_len = data.len
+
+type
+    WindowUpdateFrame* = ref WindowUpdateFrameObj
+    WindowUpdateFrameObj = object of Frame
+        window_increment: uint32
+
+proc window_increment*(w: WindowUpdateFrame) : uint32 {.inline.} = w.window_increment
+proc newWindowUpdateFrame*(stream_id: uint32; window_increment: uint32 = 0; flags: seq[string] = @[]) : Frame =
+    result = new(WindowUpdateFrame)
+    result.name = "WindowUpdateFrame"
+    result.typ = WindowUpdateFrameType.some
+    result.stream_association = STREAM_ASSOC_EITHER.some
+    initFrame(result, stream_id, flags)
+    WindowUpdateFrame(result).window_increment = window_increment
+
+method body_repr(w: WindowUpdateFrame) : string {.inline, locks: "unknown".} =
+    return "window_increment=" & $w.window_increment
+method serialize_body(w: WindowUpdateFrame) : seq[byte] {.inline, locks: "unknown".} =
+    return cast[seq[byte]](STRUCT_L.pack(w.window_increment and 0x7FFFFFFF))
+method parse_body(w: WindowUpdateFrame, data: seq[byte]) {.locks: "unknown".} =
+    if data.len > 4:
+        raise newException(InvalidFrameError, "WINDOW_UPDATE frame must have 4 byte length: got " & $data.len)
+    w.window_increment = try:
+        STRUCT_L.unpack(cast[string](data))[0].getUInt
+    except ValueError:
+        raise newException(InvalidFrameError, "Invalid WINDOW_UPDATE body")
+    if w.window_increment == 0 or w.window_increment >= ((high(uint32).int + 1) / 2).uint32:
+        raise newException(InvalidDataError, "WINDOW_UPDATE increment must be between 1 to ((high(uint32) - 1) / 2)")
+    w.body_len = 4
+
+type
+    ContinuationFrame* = ref ContinuationFrameObj
+    ContinuationFrameObj = object of Frame
+        data: seq[byte]
+
+proc data*(c: ContinuationFrame) : seq[byte] {.inline.} = c.data
+proc newContinuationFrame*(stream_id: uint32; data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame =
+    result = new(ContinuationFrame)
+    result.name = "ContinuationFrame"
+    result.typ = ContinuationFrameType.some
+    result.stream_association = STREAM_ASSOC_HAS_STREAM.some
+    result.defined_flags = @[
+        (name: "END_HEADERS", bit: 0x04'u8)
+    ]
+    initFrame(result, stream_id, flags)
+    ContinuationFrame(result).data = data
+
+method body_repr(c: ContinuationFrame) : string {.inline, locks: "unknown".} =
+    return "data=" & raw_data_repr(c.data)
+method serialize_body(c: ContinuationFrame) : seq[byte] {.inline, locks: "unknown".} =
+    return c.data
+method parse_body(c: ContinuationFrame, data: seq[byte]) {.locks: "unknown".} =
+    c.data = data
+    c.body_len = data.len
