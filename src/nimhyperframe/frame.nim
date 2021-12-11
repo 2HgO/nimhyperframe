@@ -3,6 +3,7 @@ from options import Option, get, none, some
 import struct
 import unidecode
 import tables
+from strutils import toHex
 
 from errors import ImplementationError, InvalidDataError, InvalidFrameError, InvalidPaddingError, newUnknownFrameError
 from flags import Flag, Flags, add, newFlags, `$`, `in`
@@ -67,11 +68,12 @@ proc newSetting(f: int) : Settings {.inline.} =
 
 proc raw_data_repr(data: seq[byte]) : string =
     if data.len == 0:
-        return "None"
+        return "nil"
     result = cast[string](data)
-    result = unidecode(result)
+    result = unidecode(result).toHex
     if result.len > 20:
         result = result[0..<20] & "..."
+    result = "<hex:" & result & ">"
 
 proc initFrame*(f: Frame, stream_id: uint32; flags: seq[string] = @[]) =
     f.name = if f.name == "": "Frame" else: f.name
@@ -350,7 +352,7 @@ proc newPushPromiseFrame*(stream_id: uint32; promised_stream_id: uint32 = 0; dat
         (name: "PADDED", bit: 0x08.uint8),
     ]
     result.stream_association = STREAM_ASSOC_HAS_STREAM.some
-    initFrame(result, stream_id)
+    initFrame(result, stream_id, flags)
     Padding(result).pad_length = pad_length
     PushPromiseFrame(result).data = data
     PushPromiseFrame(result).promised_stream_id = promised_stream_id
@@ -371,9 +373,9 @@ method parse_body*(p: PushPromiseFrame, data: seq[byte]) =
         STRUCT_L.unpack(cast[string](data[padding_data_length..<min(padding_data_length+4, high(data)+1)]))[0].getUInt
     except ValueError:
         raise newException(InvalidFrameError, "Invalid PUSH_PROMISE body")
-    p.data = data[padding_data_length..<data.len - p.pad_length.int]
+    p.data = data[min(padding_data_length+4, high(data)+1)..<min(data.len - p.pad_length.int, high(data)+1)]
     p.body_len = data.len
-    if p.promised_stream_id == 0 and (p.promised_stream_id and 1) != 0:
+    if p.promised_stream_id == 0 or (p.promised_stream_id and 1) != 0:
         raise newException(InvalidDataError, "Invalid PUSH_PROMISE promised stream id: " & $p.promised_stream_id)
     if p.pad_length > 0 and p.pad_length.int64 >= p.body_len:
         raise newException(InvalidPaddingError, "Padding is too long.")
@@ -390,7 +392,7 @@ proc newPingFrame*(stream_id: uint32; opaque_data: seq[byte] = @[], flags: seq[s
         (name: "ACK", bit: 0x01.uint8),
     ]
     result.stream_association = STREAM_ASSOC_NO_STREAM.some
-    initFrame(result, stream_id)
+    initFrame(result, stream_id, flags)
     PingFrame(result).opaque_data = opaque_data
 
 proc opaque_data*(p: PingFrame) : seq[byte] {.inline.} = p.opaque_data

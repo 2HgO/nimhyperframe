@@ -263,3 +263,63 @@ suite "Settings Frame test suite":
     test "Short settings frame errors":
         expect InvalidDataError:
             discard decode_frame(serialized[0..^2])
+
+suite "Push Promise Frame test suite":
+    test "repr":
+        var f = newPushPromiseFrame(1)
+        check(($f).endsWith "promised_stream_id=0, data=nil")
+        f = newPushPromiseFrame(1, promised_stream_id = 4, data = cast[seq[byte]]("testdata"))
+        checkpoint $f
+        check(($f).endsWith "promised_stream_id=4, data=<hex:7465737464617461>")
+
+    test "Push promise frame flags":
+        let f = newPushPromiseFrame(1)
+        let flags = f.parse_flags(0xFF)
+        check(flags.len == 2)
+        check("END_HEADERS" in flags)
+        check("PADDED" in flags)
+    test "Push promise frame serializes properly":
+        let f = newPushPromiseFrame(1, promised_stream_id = 4, data = cast[seq[byte]]("hello world"), flags = @["END_HEADERS"])
+        let s = f.serialize
+        echo s
+        check(s == cast[seq[byte]]("\x00\x00\x0F\x05\x04\x00\x00\x00\x01\x00\x00\x00\x04hello world"))
+    test "Push promise frame parses properly":
+        let s = cast[seq[byte]]("\x00\x00\x0F\x05\x04\x00\x00\x00\x01\x00\x00\x00\x04hello world")
+        let f = decode_frame(s)
+        check(f.typ.get == PushPromiseFrameType)
+        check(f.flags.len == 1)
+        check("END_HEADERS" in f.flags)
+        check(f.body_len == 15)
+        check(PushPromiseFrame(f).data == cast[seq[byte]]("hello world"))
+        check(PushPromiseFrame(f).promised_stream_id == 4)
+    test "Push promise frame with padding":
+        let s = cast[seq[byte]]("\x00\x00\x17\x05\x0C\x00\x00\x00\x01\x07\x00\x00\x00\x04hello worldpadding")
+        let f = decode_frame(s)
+        check(f.typ.get == PushPromiseFrameType)
+        check(f.flags.len == 2)
+        check("END_HEADERS" in f.flags)
+        check("PADDED" in f.flags)
+        check(f.body_len == 23)
+        check(PushPromiseFrame(f).data == cast[seq[byte]]("hello world"))
+        check(PushPromiseFrame(f).promised_stream_id == 4)
+    test "Push promise frame with invalid padding fails to parse":
+        let data = cast[seq[byte]]("\x00\x00\x05\x05\x08\x00\x00\x00\x01\x06\x54\x65\x73\x74")
+        expect InvalidPaddingError:
+            discard decode_frame(data)
+    test "Push promise frame with no length parses":
+        let f = newPushPromiseFrame(1, 2)
+        let data = f.serialize
+        let new_frame = decode_frame(data)
+
+        check(PushPromiseFrame(new_frame).data == newSeqOfCap[byte](0))
+    test "Push promise frame invalid":
+        var data = newPushPromiseFrame(1, 0).serialize
+        expect InvalidDataError:
+            discard decode_frame(data)
+        data = newPushPromiseFrame(1, 3).serialize
+        expect InvalidDataError:
+            discard decode_frame(data)
+    test "Short push promise errors":
+        let s = cast[seq[byte]]("\x00\x00\x0F\x05\x04\x00\x00\x00\x01\x00\x00\x00")
+        expect InvalidFrameError:
+            discard decode_frame(s)
