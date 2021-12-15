@@ -238,6 +238,7 @@ proc flow_controlled_length*(d: DataFrame) : uint32 =
     result = d.data.len.uint32 + padding_len
 
 proc data*(d: DataFrame) : lent seq[byte] {.inline.} = d.data
+proc `data=`*(d: DataFrame, data: seq[byte]) {.inline.} = d.data = data
 proc pad_length*(d: DataFrame) : uint32 {.inline.} = result = d.pad_length
 
 method serialize_body(d: DataFrame) : seq[byte] {.locks: "unknown".} =
@@ -374,6 +375,7 @@ proc newPushPromiseFrame*(stream_id: uint32; promised_stream_id: uint32 = 0; dat
     PushPromiseFrame(result).promised_stream_id = promised_stream_id
 
 proc data*(p: PushPromiseFrame) : lent seq[byte] {.inline.} = p.data
+proc `data=`*(p: PushPromiseFrame, d: seq[byte]) {.inline.} = p.data = d
 proc promised_stream_id*(p: PushPromiseFrame) : uint32 {.inline.} = p.promised_stream_id
 proc pad_length*(p: PushPromiseFrame) : uint32 {.inline.} = result = p.pad_length
 
@@ -543,6 +545,7 @@ type
         data: seq[byte]
 
 proc data*(c: ContinuationFrame) : lent seq[byte] {.inline.} = c.data
+proc `data=`*(c: ContinuationFrame, d: seq[byte]) {.inline.} = c.data = d
 proc newContinuationFrame*(stream_id: uint32; data: seq[byte] = @[]; flags: seq[string] = @[]) : Frame =
     result = new(ContinuationFrame)
     result.name = "ContinuationFrame"
@@ -611,6 +614,7 @@ proc depends_on*(h: HeadersFrame) : uint32 {.inline.} = h.depends_on
 proc stream_weight*(h: HeadersFrame) : uint8 {.inline.} = h.stream_weight
 proc exclusive*(h: HeadersFrame) : bool {.inline.} = h.exclusive
 proc data*(h: HeadersFrame) : lent seq[byte] {.inline.} = h.data
+proc `data=`*(h: HeadersFrame, d: seq[byte]) {.inline.} = h.data = d
 
 proc newHeadersFrame*(stream_id: uint32; pad_length: uint32 = 0; data: seq[byte] = @[]; depends_on: uint32 = 0, stream_weight: uint8 = 0, exclusive: bool = false; flags: seq[string] = @[]) : Frame =
     result = new(HeadersFrame)
